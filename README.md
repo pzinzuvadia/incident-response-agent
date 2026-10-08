@@ -7,7 +7,7 @@
 
 An agent that answers questions about production incidents by reading across two kinds of data at once: 200 structured incident records and 14 written postmortems. It runs locally on synthetic data, with no cloud account and no framework.
 
-The incident domain is a vehicle. What the repo is actually about is the harness around the model — retrieval, tool design, authorization, and tracing which is where the engineering turned out to live.
+The incident domain is a vehicle. What the repo is actually about is the harness around the model — retrieval, tool design, authorization, and tracing — which is where the engineering turned out to live.
 
 ## Quick start
 
@@ -16,8 +16,7 @@ Python 3.10+ and an Anthropic API key.
 ```bash
 git clone https://github.com/pzinzuvadia/incident-response-agent.git
 cd incident-response-agent
-```
-```bash
+
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env                    # add ANTHROPIC_API_KEY
@@ -27,7 +26,22 @@ python src/ingest.py                    # 14 postmortems → vector store
 python src/agent.py "We're seeing payment timeouts again. Has this happened before, and who should I call?" --trace
 ```
 
-First run of `ingest.py` downloads an ~80MB embedding model. Detailed setup is in [§5](#).
+First run of `ingest.py` downloads an ~80MB embedding model. Step-by-step instructions are in [Setup](#setup).
+
+## Contents
+
+| Section | |
+|---|---|
+| [What that produces](#what-that-produces) | one real run, with its trace |
+| [The agent is the easy part](#the-agent-is-the-easy-part) | the argument, in four claims |
+| [Why an incident assistant](#why-an-incident-assistant) | why this domain demonstrates them |
+| [Who this is for](#who-this-is-for) · [What is in the repo](#what-is-in-the-repo) | orientation |
+| [Architecture](#architecture) · [Two shapes of knowledge](#two-shapes-of-knowledge) · [How one question flows](#how-one-question-flows) | the system |
+| [**The four decisions**](#the-four-decisions) | the core — rule, instance, and what each cost |
+| [Setup](#setup) | detailed install, with expected output |
+| [Four questions worth running](#four-questions-worth-running) | including the one that gets refused |
+| [What broke](#what-broke) · [What still does not work](#what-still-does-not-work) | the honest part |
+| [When not to build this](#when-not-to-build-this) · [What I would build next](#what-i-would-build-next) | the trade-offs |
 
 ## What that produces
 
@@ -78,73 +92,76 @@ Three things in that output are worth noticing before anything else.
 
 **The same question from a contractor returns the same history and no phone number.** The refusal happens inside the tool, not in the prompt. That one is the longest section of this README.
 
-
 ## The agent is the easy part
 
-The loop in this repo is about few lines. Send the question and the tool schemas to a model, run whatever tool it asks for, send the result back, repeat until it answers with text instead of another tool call. That is the entire agent, and it is the least interesting file here.
+Send the question and the tool schemas to a model, run whatever tool it asks for, send the result back, repeat until it answers with text instead of another tool call. Here is the whole thing:
+
+```python
+for iteration in range(MAX_ITERATIONS):
+    response = client.messages.create(
+        model=MODEL, max_tokens=2000, system=SYSTEM_PROMPT,
+        tools=TOOL_SCHEMAS, messages=messages,
+    )
+
+    if response.stop_reason != "tool_use":
+        return finish(...)                       # model answered; done
+
+    messages.append({"role": "assistant", "content": response.content})
+
+    results = []
+    for block in response.content:
+        if block.type != "tool_use":
+            continue
+        results.append({
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": run_tool(block.name, block.input, ctx),
+        })
+
+    messages.append({"role": "user", "content": results})
+```
+
+Twenty-five lines, and the least interesting file in the repo. No framework, because frameworks earn their place with checkpointing, human-in-the-loop interrupts, branching state machines and multi-agent handoff — and this is a single-turn, read-only question answerer that needs none of them. A framework here would put a layer of abstraction between you and the thing you are trying to understand.
 
 The hard part starts the moment that loop points at data that matters.
 
 Can it reach records this particular person should not see? When the answer is wrong, can you tell whether it retrieved badly or reasoned badly? What happens when a contractor asks the same question an engineer just asked? Three weeks from now, when someone disputes an answer, can you reconstruct what it actually did?
 
-None of those are model problems. They are problems with everything around the model, how knowledge gets into the system, what the agent is allowed to touch, who is asking, and what gets written down. That layer is where the real work is, and it is the part most agent examples skip, because a demo does not need it and a deployment does not survive without it.
+None of those are model problems. They are problems with everything around the model — how knowledge gets into the system, what the agent is allowed to touch, who is asking, and what gets written down. That layer is where the real work is, and it is the part most agent examples skip, because a demo does not need it and a deployment does not survive without it.
 
-This repo is a working instance of that layer. Four decisions carry almost all of it.
+This repo is a working instance of that layer. Four decisions carry almost all of it, and each is covered in full [below](#the-four-decisions):
 
-### Retrieval quality is decided at ingestion, not at query time
+1. **Retrieval quality is decided at ingestion, not at query time.** By the time you are tuning a query, you are working around a decision you already made.
+2. **Tool descriptions are documentation with a non-human reader.** They are read literally, including numbers mentioned in passing.
+3. **Authorization belongs in the tool, not the prompt.** You cannot ask a model nicely to keep a secret.
+4. **Monitoring tells you the service is up. It does not tell you what the agent did.** Every signal can be green while the answer is wrong.
 
-When retrieval underperforms, the instinct is to tune the query, raise `top_k`, or swap the embedding model. Usually the damage was done earlier, when documents were split into chunks that lost the context they needed to be found. By the time you are tuning a query, you are working around a decision you already made.
+The incident assistant is how those are demonstrated. The next section explains why that example was chosen.
 
-### Tool descriptions are documentation with a non-human reader
+## Why an incident assistant
 
-A tool description is not a comment. It is the only interface the model has when it decides what to call, and it is read literally — including numbers mentioned in passing, which the model will pass as arguments. Vague descriptions do not produce a confused user. They produce a wrong tool call and therefore a wrong answer.
+The four claims need a domain where all of them are true at once, not one where three have to be invented. Incident response gives you all four for free.
 
-### Authorization belongs in the tool, not the prompt
+The knowledge is genuinely split — incident records are structured, postmortems are prose, and neither converts into the other without losing what makes it useful. The useful questions span both halves: *"has this happened before, and who should I call"* needs the written history, the structured records, and an ownership lookup. Different people legitimately see different things, so authorization is already in the problem rather than bolted on to make a point. And an invented answer has a real cost — at 2am during an outage, a plausible wrong number is worse than no number, because someone will act on it.
 
-You cannot ask a model nicely to keep a secret. An instruction in a system prompt is not a security control, it is a suggestion to a probabilistic text generator, and it degrades under paraphrase and long context. Restricting the agent to a fixed set of tools helps, but it answers a different question: *what can this agent ever do*, rather than *what may this person see right now*.
-
-### Monitoring tells you the service is up. It does not tell you what the agent did.
-
-Standard observability answers: did it respond, how fast, did it error. Every one of those can be green while the answer is wrong. What you need instead is a record of which tools were called, with what arguments, for which user, and what came back — including the calls that were refused.
-
----
-
-These four are the subject. The incident response assistant is how they are demonstrated, and the next section explains why that example was chosen.
-
-
-## Why an incident response assistant
-
-The four claims above need a domain where they are all genuinely true at once, not a domain where three of them have to be invented. Incident response is that, for four reasons.
-
-**The knowledge is really split.** Incident records are structured — service, severity, timestamps, duration. Postmortems are prose, written by whoever was on call, in whatever shape they felt like. Neither one can be converted into the other without losing what makes it useful. That is the honest version of the retrieval-plus-query problem, rather than a contrived one.
-
-**The useful questions span both halves.** "Has this happened before, and who should I call" needs the written history *and* the structured records *and* an ownership lookup. A question that one source could answer would not show you anything.
-
-**Different people legitimately see different things.** On-call engineers, support staff, an incident commander, a contractor covering a service they do not own — all of them have a real reason to ask, and not all of them should get a phone number. Authorization is not bolted on to make a point; it is already there in the problem.
-
-**An invented answer has a cost.** At 2am during an outage, a plausible wrong answer is worse than no answer, because someone will act on it. That makes grounding and refusal behaviour load-bearing rather than decorative.
-
-One more reason, which is about the writing rather than the engineering: nobody needs the domain explained. You already know what an outage is. That keeps the attention on the architecture.
+One more reason, about the writing rather than the engineering: nobody needs the domain explained, which keeps attention on the architecture.
 
 ## Who this is for
 
-**You built an agent demo and now need it to be real.** The gap between "it answered my question" and "I would let someone else run this" is almost entirely in the authorization and tracing sections.
-
-**You are deciding between RAG and a plain query.** The walkthrough is a worked example of when retrieval is the wrong tool, and of giving the agent both so it can choose.
-
-**You are wiring an agent up to data with access rules.** The authorization section argues that restricting an agent to a fixed tool list is necessary and not sufficient, and shows the alternative running.
-
-**You want something to break.** Everything runs locally on generated data. Clone it, change the role flag, reword a tool description, and watch the trace change.
+- **You built an agent demo and now need it to be real** → [authorization](#3-authorization-belongs-in-the-tool-not-the-prompt) and [tracing](#4-monitoring-tells-you-the-service-is-up-it-does-not-tell-you-what-the-agent-did)
+- **You are deciding between RAG and a plain query** → [the tool table](#2-tool-descriptions-are-documentation-with-a-non-human-reader) and [when not to build this](#when-not-to-build-this)
+- **Your retrieval underperforms and you have been tuning queries** → [ingestion](#1-retrieval-quality-is-decided-at-ingestion-not-at-query-time)
+- **You want something to break** → clone it, change the `--role` flag, reword a tool description, and watch the trace change
 
 No Teradata, OpenAI, LangChain, or cloud account required. Python, SQLite, Chroma, and one Anthropic API key.
 
 ## What is in the repo
 
 ```
-incident-agent/
+incident-response-agent/
 ├── generate_data.py          seeded generator → 200 incidents in SQLite
 ├── requirements.txt          four dependencies
-├── .env                      copy to .env, add your API key
+├── .env.example              copy to .env, add your API key
 │
 ├── data/
 │   ├── postmortems/          14 markdown postmortems — committed
@@ -163,9 +180,9 @@ incident-agent/
     └── check_mcp.py          inspect the tool layer alone, no model needed
 ```
 
-The only thing in this repo a human wrote by hand is the 14 postmortems. The incident table, the vector store and the trace database are all generated, reproducibly, from a fixed seed.
+The only thing here a human wrote by hand is the 14 postmortems. The incident table, the vector store and the trace database are all generated, reproducibly, from a fixed seed.
 
-Three things in that listing are worth explaining now, because they look redundant and are not.
+Three things in that listing look redundant and are not.
 
 **Two agents.** `agent.py` calls the tools as Python functions. `agent_mcp.py` reaches the same tools through an MCP server running as a separate process. They produce the same answers. The difference is where identity comes from, and that difference is the subject of the authorization section — showing it was the reason to write both.
 
@@ -209,7 +226,7 @@ flowchart TB
 
 **The question arrives with an identity** — who is asking and what role they hold. That identity comes from the caller. The model never sees it and cannot set it.
 
-**The loop** sends the question and the tool schemas to the model, gets back either a tool call or a final answer, runs the call, appends the result, and goes again until the model stops asking for tools or hits the iteration cap. It is 25 lines and it is the least interesting file in the repo.
+**The loop** sends the question and the tool schemas to the model, gets back either a tool call or a final answer, runs the call, appends the result, and goes again until the model stops asking for tools or hits the iteration cap.
 
 **The tool layer** is where authorization is enforced. Five tools, each checking the caller's identity before it touches data. A refusal here raises an exception rather than returning an empty result, because an agent told "denied" behaves very differently from one that quietly concludes the data does not exist.
 
@@ -219,23 +236,21 @@ flowchart TB
 
 ## Two shapes of knowledge
 
-The reason this architecture needs both stores is that incident knowledge genuinely arrives in two shapes, and converting either into the other loses what makes it useful.
+**Structured** — 200 incidents across 8 services over 12 months, in SQLite. 16 Sev-1, 46 Sev-2, 138 Sev-3. Each row carries service, severity, timestamps, resolution minutes, root cause category, owning team, and on-call contact fields. This answers *how many*, *how often*, *how long*.
 
-**Structured** — 200 incidents across 8 services over 12 months, in SQLite. 16 Sev-1, 46 Sev-2, 138 Sev-3. Each row carries service, severity, timestamps, resolution minutes, root cause category, owning team, and on-call contact fields. This is what answers *how many*, *how often*, *how long*.
+**Unstructured** — 14 markdown postmortems with the sections a real one has: Summary, Timeline, Root cause, Resolution, Follow-ups, Notes. This answers *why*, and *what did we do about it*.
 
-**Unstructured** — 14 markdown postmortems with the sections a real one has: Summary, Timeline, Root cause, Resolution, Follow-ups, Notes. This is what answers *why*, and *what did we do about it*.
-
-Only 14 of the 200 incidents have a postmortem, which is roughly the ratio you would find in a real organisation. That asymmetry matters: an agent that searched only documents would conclude most incidents never happened.
+Only 14 of the 200 incidents have a postmortem, roughly the ratio you would find in a real organisation. That asymmetry matters: an agent searching only documents would conclude most incidents never happened.
 
 ### One deliberate choice in the schema
 
 The contact fields live **in the same table as everything else.** They are not hidden in a separate store the agent simply has no connection string for.
 
-That is on purpose. Hiding data by not wiring it up is not access control — it is luck, and it stops being true the moment somebody adds a convenient join. Putting the restricted fields in the same row as the unrestricted ones forces the rule to be enforced where the data is read, which is the only place it holds.
+Hiding data by not wiring it up is not access control — it is luck, and it stops being true the moment somebody adds a convenient join. Putting the restricted fields in the same row as the unrestricted ones forces the rule to be enforced where the data is read, which is the only place it holds.
 
 ### What is planted in the data
 
-The corpus is generated from a fixed seed, and one pattern is planted deliberately: a connection-pool problem recurring across five payments incidents over ten months, escalating from Sev-3 to a Sev-1, with a deferred follow-up that goes unfixed through three of them.
+One pattern is planted deliberately: a connection-pool problem recurring across five payments incidents over ten months, escalating from Sev-3 to a Sev-1, with a deferred follow-up that goes unfixed through three of them.
 
 **None of those five mention "connection pool" in a title or summary.** That is the retrieval test. A second service hits the same failure later and its postmortem notes that the payments writeups would have saved them time — which is the argument for the whole tool in one line.
 
@@ -292,7 +307,7 @@ The direct version in `agent.py` skips steps 2, 3, 4 and 8 — it constructs the
 
 ## The four decisions
 
-Each of these is stated as a rule first, then as what the rule looked like in this repo, then as what it cost.
+Each is stated as a rule, then as what the rule looked like here, then as what it cost.
 
 ---
 
@@ -340,11 +355,7 @@ WITH the prefix — carries its own identity into the vector:
 python src/check_retrieval.py
 ```
 
-**What it cost, and what still does not work.** Section-based chunking means chunk sizes vary a lot — a Timeline section can be ten times the length of a Summary, and long chunks dilute their own embeddings.
-
-Two weaknesses I left in place. Resolution sections retrieve poorly, because they are terse and procedural, so queries phrased as "how was it fixed" underperform. And payments dominates the corpus, so payments chunks surface slightly too eagerly for generic questions.
-
-Both are honest properties of a small corpus, and the structured tool compensates for both — which is the actual lesson. Retrieval does not have to be perfect when the agent has another route to the same fact.
+**What it cost.** Section-based chunking means chunk sizes vary a lot — a Timeline section can be ten times the length of a Summary, and long chunks dilute their own embeddings. Two further weaknesses are listed in [what still does not work](#what-still-does-not-work); I left both in place, because the structured tool compensates for them. That is the real lesson here: retrieval does not have to be perfect when the agent has another route to the same fact.
 
 ---
 
@@ -379,11 +390,9 @@ So the descriptions say what each tool is *not* for:
 }
 ```
 
-That last clause removed an entire class of wrong plans.
+That last clause removed an entire class of wrong plans. The reverse also happened: a number left in a description quietly overrode the Python default, which is the second entry in [what broke](#what-broke).
 
-**The bug that proved the point.** I raised the `limit` default in `list_incidents` from 20 to 50 and nothing changed. The model was passing `limit=20` explicitly — because the number appeared in the tool's description text. The description was the live configuration; the Python default was decoration.
-
-**What it cost.** Writing descriptions this carefully is slow, and they are easy to let drift out of sync with the code. There is no type checker for prose. The failure mode is quiet: nothing errors, the agent just starts choosing differently.
+**What it cost.** Writing descriptions this carefully is slow, and they drift out of sync with the code. There is no type checker for prose, and the failure mode is quiet — nothing errors, the agent just starts choosing differently.
 
 ---
 
@@ -418,7 +427,7 @@ def _redact(row: dict, ctx: UserContext) -> dict:
     return {k: v for k, v in row.items() if k not in RESTRICTED_FIELDS}
 ```
 
-Two properties are doing the work. The check lives at the **data layer**, so a new tool that reads the incidents table inherits redaction rather than having to remember the rule — gating `get_oncall_contact` while leaving contact columns in the rows returned by `list_incidents` would be theatre. And a refusal **raises** rather than returning empty, because a refusal is an event worth recording, and because an agent told "denied" behaves very differently from one that silently concludes the data does not exist.
+Two properties do the work. The check lives at the **data layer**, so a new tool that reads the incidents table inherits redaction rather than having to remember the rule — gating `get_oncall_contact` while leaving contact columns in the rows returned by `list_incidents` would be theatre. And a refusal **raises** rather than returning empty, because a refusal is an event worth recording, and because an agent told "denied" behaves very differently from one that silently concludes the data does not exist.
 
 **Where MCP makes the problem real.** Locally, passing a `UserContext` is trivial — the loop and the tool are the same program, so of course you can pass it safely. The hard version only appears once the tools run somewhere else, which is where every real system lives.
 
@@ -446,8 +455,6 @@ Identical tool surface. Different data. The difference is not in the schema, the
 
 **What it cost.** The MCP path is a subprocess to manage, an async client, a round trip for tool discovery, and a failure mode where the server dies and the agent has no tools at all. Locally that buys nothing — these could stay Python functions. It is here because the authorization argument is weak until the tools are genuinely somewhere else.
 
-The role model is also deliberately crude: two roles, one restricted field set, hardcoded. A real system reads this from the same identity provider that governs every other system, and the agent does not get its own parallel permission model.
-
 ---
 
 ### 4. Monitoring tells you the service is up. It does not tell you what the agent did.
@@ -468,7 +475,7 @@ class TraceEvent:
     result_summary: str
 ```
 
-`arguments` is in there deliberately. Knowing `list_incidents` was called tells you almost nothing. Knowing it was called with `since='2024-10-01'` tells you exactly what went wrong — which is a real bug from this repo, covered in [what broke](#).
+`arguments` is in there deliberately. Knowing `list_incidents` was called tells you almost nothing. Knowing it was called with `since='2024-10-01'` tells you exactly what went wrong — which is a real bug from this repo, covered in [what broke](#what-broke).
 
 Add `--trace` to any run to see it. But printing only helps for a run you are watching, so every event is also written to `data/traces.db`:
 
@@ -530,8 +537,8 @@ python3 --version
 ### 1. Clone and create a virtual environment
 
 ```bash
-git clone https://github.com/pzinzuvadia/incident-agent.git
-cd incident-agent
+git clone https://github.com/pzinzuvadia/incident-response-agent.git
+cd incident-response-agent
 
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -559,7 +566,7 @@ Open `.env` and set:
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-`.env` is gitignored. The optional `MODEL` variable overrides the default model if you want to compare behaviour across models — which is worth doing, because tool-choice behaviour differs more than you would expect.
+`.env` is gitignored. The optional `MODEL` variable overrides the default model if you want to compare behaviour across models — worth doing, because tool-choice behaviour differs more than you would expect.
 
 ### 4. Generate the incident data
 
@@ -597,16 +604,11 @@ Note the asymmetry in that last line: one postmortem has no Timeline section, an
 Neither of these needs an API key. Both print rather than assert — they are for looking, not for passing.
 
 ```bash
-python src/check_retrieval.py
+python src/check_retrieval.py     # is retrieval finding the right chunks?
+python src/check_mcp.py           # is the tool layer enforcing the right rules?
 ```
 
-Fires six fixed queries at the vector store and prints the top hits with their distances. **Lower distance is closer.** This answers "is retrieval finding the right chunks" without a model in the way.
-
-```bash
-python src/check_mcp.py
-```
-
-Starts the MCP server twice, once as an engineer and once as a contractor, lists the advertised tools, and calls three of them as each user. This answers "is the tool layer enforcing the right rules" without a model in the way.
+The first fires six fixed queries at the vector store and prints the top hits with their distances — **lower distance is closer**. The second starts the MCP server twice, once as an engineer and once as a contractor, and calls three tools as each.
 
 If the agent later gives a bad answer, these two tell you which layer to blame.
 
@@ -615,8 +617,6 @@ If the agent later gives a bad answer, these two tell you which layer to blame.
 ```bash
 python src/agent.py "How many Sev-1 incidents last quarter, and what was the median resolution time?" --trace
 ```
-
-Flags:
 
 | Flag | Default | What it does |
 |---|---|---|
@@ -660,7 +660,7 @@ rm -rf data/incidents.db data/chroma data/traces.db
 
 ## Four questions worth running
 
-The cross-source question is at the top of this README. These are the other three, each chosen because it shows something different about how the system behaves.
+The cross-source question is [at the top](#what-that-produces). These are the other three, each showing something different.
 
 ### One tool, when one tool is right
 
@@ -687,9 +687,9 @@ TRACE
 
 Counting and medians are query operations. The agent did not search a single document, and it should not have — dressing an aggregate up as semantic search makes it slower and less correct.
 
-Note the arguments: the model resolved "last quarter" to a real date range. It did not always. That is the first entry in [what broke](#).
+Note the arguments: the model resolved "last quarter" to a real date range. It did not always. That is the first entry in [what broke](#what-broke).
 
-This is also the case that makes the trade-off concrete. If this is the question you ask every Monday, do not build an agent. Build a dashboard. It is faster, cheaper, deterministic, and it cannot hallucinate.
+This is also the case that makes the trade-off concrete. If this is the question you ask every Monday, do not build an agent. Build a dashboard.
 
 ### The same question, from two different people
 
@@ -713,7 +713,7 @@ The contractor is not locked out of the system. They lose one field. They keep t
 
 And the agent says so plainly instead of inventing a plausible name, because the tool raised rather than returning empty.
 
-Two honest notes about reading this comparison. The prose differs between the two runs beyond the contact line — different wording, different ordering, a slightly different selection of incidents cited. That is planning non-determinism, not a permissions effect. What differs *because of permissions* is exactly one tool outcome and one field. Read the trace, not the paragraphs.
+One honest note about reading this comparison. The prose differs between the two runs beyond the contact line — different wording, different ordering, a slightly different selection of incidents cited. That is planning non-determinism, not a permissions effect. What differs *because of permissions* is exactly one tool outcome and one field. Read the trace, not the paragraphs.
 
 ### Refusing to answer
 
@@ -722,19 +722,16 @@ python src/agent.py "What did these outages cost us in lost revenue?" --trace
 ```
 
 ```
-I don't have access to revenue or financial data through the incident tools available to me. The tools I can use provide:
+I don't have access to revenue or financial data through the incident
+tools available to me. The tools I can use provide incident records,
+postmortem write-ups, on-call contact information, and statistics about
+incident frequency and resolution times.
 
-- Incident records (dates, durations, affected services, severity)
-- Postmortem write-ups (root causes, remediation steps, lessons learned)
-- On-call contact information
-- Statistics about incident frequency and resolution times
+[...]
 
-To get revenue impact estimates, you would need to contact:
-- Your finance or business operations team
-- The service owners who may track revenue metrics for their services
-- Leadership who may have access to revenue dashboards
-
-If you'd like, I can help you identify which incidents occurred during a specific time period, how long services were down, or which services were affected - information that might be useful for a revenue impact analysis.
+If you'd like, I can help you identify which incidents occurred during a
+specific time period, how long services were down, or which services were
+affected — information that might be useful for a revenue impact analysis.
 
 ==============================================================================
 TRACE
@@ -744,7 +741,7 @@ TRACE
 
 There is no revenue data anywhere in this system. The agent could have called `incident_stats`, collected durations, and produced an estimate that looked authoritative. It called nothing.
 
-That behaviour comes from one line in the system prompt — *never fill a gap with what you know about software in general* — combined with tool descriptions narrow enough that none of them plausibly fits. During an incident, a confident wrong number is worse than no number, because someone will put it in an email.
+That comes from one line in the system prompt — *never fill a gap with what you know about software in general* — combined with tool descriptions narrow enough that none of them plausibly fits. During an incident, a confident wrong number is worse than no number, because someone will put it in an email.
 
 ### Phrasing changes the plan more than permissions do
 
@@ -758,7 +755,7 @@ python src/agent_mcp.py "Payment timeouts again, who do I call?" --user p.zinzuv
 # → 1 tool call: get_oncall_contact, ok
 ```
 
-The short phrasing gets one tool call. The longer phrasing at the top of this README gets three. I initially read this as a bug — a refusal causing the agent to abandon the rest of the question — and the controlled run disproved it in one command: the engineer, who is refused nothing, behaves identically. The variable was the wording, not the role. *"Who do I call"* is one explicit question; *"has this happened before, and who should I call"* is two.
+The short phrasing gets one tool call. The longer phrasing at the top of this README gets three. I initially read this as a bug — a refusal causing the agent to abandon the rest of the question — and one controlled run disproved it: the engineer, who is refused nothing, behaves identically. The variable was the wording, not the role. *"Who do I call"* is one explicit question; *"has this happened before, and who should I call"* is two.
 
 Worth noticing what made that diagnosis cheap. Comparing two English paragraphs would have told me nothing. Comparing two traces took one run.
 
@@ -775,7 +772,7 @@ SYSTEM_PROMPT = f"Today's date is {date.today().isoformat()}. ..."
 
 **A default I changed had no effect.** I raised the `limit` default in `list_incidents` from 20 to 50, and the agent kept returning 20 rows — occasionally missing INC-0100, the Sev-1 that makes the payments pattern obvious. The model was passing `limit=20` explicitly, having read the number out of the tool's description text. The description was the live configuration. The Python default was decoration.
 
-**Planning is non-deterministic, and it mimics other bugs.** The same question produces different tool orders and sometimes different tool counts across runs. Usually every ordering is correct, which makes it easy to miss — and means any test asserting an exact call sequence will flake. It also produces false bug reports: see the phrasing investigation in [four questions worth running](#), where two runs that differed only in wording looked like an authorization failure for about ten minutes.
+**Planning is non-deterministic, and it mimics other bugs.** The same question produces different tool orders and sometimes different tool counts across runs. Usually every ordering is correct, which makes it easy to miss — and means any test asserting an exact call sequence will flake. It also produces false bug reports: see [the phrasing investigation](#phrasing-changes-the-plan-more-than-permissions-do) above, where two runs that differed only in wording looked like an authorization failure for about ten minutes.
 
 ## What still does not work
 
@@ -801,7 +798,7 @@ An agent is the wrong answer more often than the current discourse suggests.
 
 **If you cannot enforce authorization at the data boundary, stop.** If the only thing between a user and data they should not see is a sentence in a prompt, you do not have a prototype. You have a liability with a good demo.
 
-**What it costs when it is the right answer.** A few hundred milliseconds to several seconds per question. A model call per tool round trip. An execution path that is non-deterministic and genuinely harder to test than a query. Those are real prices, and they are worth paying only for the questions a dashboard cannot anticipate.
+**What it costs when it is the right answer.** A few hundred milliseconds to several seconds per question. A model call per tool round trip. An execution path that is non-deterministic and genuinely harder to test than a query.
 
 ## What I would build next
 
@@ -811,7 +808,7 @@ In the order I would do it.
 
 **A model-graded eval.** Fixed questions, expected answers, a second model judging whether the response matches. It brings its own problems — now you are trusting a grader — but it closes the gap the inspection scripts leave open.
 
-**Live authorization rather than bound-at-start.** Right now identity is fixed when the server process starts. Membership changes do not take effect until the process restarts. The production version of this problem is token lifetime: if a role is revoked, how long until the agent stops honouring it? I hit the same gap on an enterprise MCP deployment at SAP, where group changes took up to an hour to propagate. It is the kind of thing that never surfaces in a demo and always surfaces in an audit.
+**Live authorization rather than bound-at-start.** Right now identity is fixed when the server process starts, so membership changes do not take effect until it restarts. The production version of this is token lifetime: if a role is revoked, how long until the agent stops honouring it? I hit the same gap on an enterprise MCP deployment at SAP, where group changes took up to an hour to propagate. It never surfaces in a demo and always surfaces in an audit.
 
 **Incremental ingestion.** `ingest.py` rebuilds the whole collection every run. Fine for 14 documents, absurd for 14,000. Real corpora need change detection, re-embedding only what moved, and a story for deletions.
 
@@ -828,4 +825,3 @@ Change the domain and the data. The engineering does not move.
 ---
 
 *Built by [Priyansh Zinzuvadia](https://www.linkedin.com/in/pszinzuvadia/). The longer argument is on [Medium](#MEDIUM).*
-
