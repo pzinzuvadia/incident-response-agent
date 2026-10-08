@@ -111,3 +111,184 @@ Standard observability answers: did it respond, how fast, did it error. Every on
 
 These four are the subject. The incident response assistant is how they are demonstrated, and the next section explains why that example was chosen.
 
+
+## Why an incident response assistant
+
+The four claims above need a domain where they are all genuinely true at once, not a domain where three of them have to be invented. Incident response is that, for four reasons.
+
+**The knowledge is really split.** Incident records are structured — service, severity, timestamps, duration. Postmortems are prose, written by whoever was on call, in whatever shape they felt like. Neither one can be converted into the other without losing what makes it useful. That is the honest version of the retrieval-plus-query problem, rather than a contrived one.
+
+**The useful questions span both halves.** "Has this happened before, and who should I call" needs the written history *and* the structured records *and* an ownership lookup. A question that one source could answer would not show you anything.
+
+**Different people legitimately see different things.** On-call engineers, support staff, an incident commander, a contractor covering a service they do not own — all of them have a real reason to ask, and not all of them should get a phone number. Authorization is not bolted on to make a point; it is already there in the problem.
+
+**An invented answer has a cost.** At 2am during an outage, a plausible wrong answer is worse than no answer, because someone will act on it. That makes grounding and refusal behaviour load-bearing rather than decorative.
+
+One more reason, which is about the writing rather than the engineering: nobody needs the domain explained. You already know what an outage is. That keeps the attention on the architecture.
+
+## Who this is for
+
+**You built an agent demo and now need it to be real.** The gap between "it answered my question" and "I would let someone else run this" is almost entirely in the authorization and tracing sections.
+
+**You are deciding between RAG and a plain query.** The walkthrough is a worked example of when retrieval is the wrong tool, and of giving the agent both so it can choose.
+
+**You are wiring an agent up to data with access rules.** The authorization section argues that restricting an agent to a fixed tool list is necessary and not sufficient, and shows the alternative running.
+
+**You want something to break.** Everything runs locally on generated data. Clone it, change the role flag, reword a tool description, and watch the trace change.
+
+No Teradata, OpenAI, LangChain, or cloud account required. Python, SQLite, Chroma, and one Anthropic API key.
+
+## What is in the repo
+
+```
+incident-agent/
+├── generate_data.py          seeded generator → 200 incidents in SQLite
+├── requirements.txt          four dependencies
+├── .env                      copy to .env, add your API key
+│
+├── data/
+│   ├── postmortems/          14 markdown postmortems — committed
+│   ├── incidents.db          generated, gitignored
+│   ├── chroma/               generated, gitignored
+│   └── traces.db             generated, gitignored
+│
+└── src/
+    ├── ingest.py             postmortems → chunks → vector store
+    ├── tools.py              the five tools, UserContext, redaction
+    ├── trace.py              trace events, the @traced decorator, persistence
+    ├── agent.py              the loop, calling tools as local functions
+    ├── agent_mcp.py          the same loop, tools across a process boundary
+    ├── mcp_server.py         the five tools served over MCP
+    ├── check_retrieval.py    inspect retrieval alone, no model needed
+    └── check_mcp.py          inspect the tool layer alone, no model needed
+```
+
+The only thing in this repo a human wrote by hand is the 14 postmortems. The incident table, the vector store and the trace database are all generated, reproducibly, from a fixed seed.
+
+Three things in that listing are worth explaining now, because they look redundant and are not.
+
+**Two agents.** `agent.py` calls the tools as Python functions. `agent_mcp.py` reaches the same tools through an MCP server running as a separate process. They produce the same answers. The difference is where identity comes from, and that difference is the subject of the authorization section — showing it was the reason to write both.
+
+**Two check scripts, neither of which is a test suite.** `check_retrieval.py` fires fixed queries at the vector store and prints what comes back. `check_mcp.py` connects to the MCP server and calls tools as two different users. Both run without an API key, both print rather than assert. They exist because when an agent gives a bad answer, the first question is *which layer*, and guessing is expensive.
+
+**A separate trace database.** Incident data and operational telemetry about the system that reads it are different things with different lifecycles. `generate_data.py` recreates `incidents.db` on every run, and an audit record a dev script can wipe is not an audit record.
+
+## Architecture
+
+Five pieces, and only one of them is the model.
+
+```mermaid
+flowchart TB
+    Q["<b>Question</b><br/><i>+ who is asking</i>"]
+    L["<b>Agent loop</b><br/>agent.py · agent_mcp.py<br/><i>25 lines</i>"]
+    M["<b>Model</b><br/><i>decides which tools</i>"]
+
+    subgraph TL["Tool layer — tools.py · authorization enforced here"]
+        direction LR
+        T1["search_<br/>postmortems"]
+        T2["list_<br/>incidents"]
+        T3["get_<br/>incident"]
+        T4["incident_<br/>stats"]
+        T5["get_oncall_<br/>contact"]
+    end
+
+    V[("Chroma<br/>69 chunks from<br/>14 postmortems")]
+    S[("SQLite<br/>200 incident<br/>records")]
+    TR[("traces.db<br/>every call, every<br/>refusal, forever")]
+
+    Q --> L
+    L <--> M
+    L --> TL
+    T1 --> V
+    T2 --> S
+    T3 --> S
+    T4 --> S
+    T5 --> S
+    TL -.->|every call| TR
+```
+
+**The question arrives with an identity** — who is asking and what role they hold. That identity comes from the caller. The model never sees it and cannot set it.
+
+**The loop** sends the question and the tool schemas to the model, gets back either a tool call or a final answer, runs the call, appends the result, and goes again until the model stops asking for tools or hits the iteration cap. It is 25 lines and it is the least interesting file in the repo.
+
+**The tool layer** is where authorization is enforced. Five tools, each checking the caller's identity before it touches data. A refusal here raises an exception rather than returning an empty result, because an agent told "denied" behaves very differently from one that quietly concludes the data does not exist.
+
+**Two data stores** sit behind the tools — a SQLite table of incident records and a Chroma vector store of postmortem chunks. Structured facts in one, written narrative in the other.
+
+**A trace database** underneath, recording every call: who, which tool, what arguments, what outcome, how long, and a one-line summary of what came back.
+
+## Two shapes of knowledge
+
+The reason this architecture needs both stores is that incident knowledge genuinely arrives in two shapes, and converting either into the other loses what makes it useful.
+
+**Structured** — 200 incidents across 8 services over 12 months, in SQLite. 16 Sev-1, 46 Sev-2, 138 Sev-3. Each row carries service, severity, timestamps, resolution minutes, root cause category, owning team, and on-call contact fields. This is what answers *how many*, *how often*, *how long*.
+
+**Unstructured** — 14 markdown postmortems with the sections a real one has: Summary, Timeline, Root cause, Resolution, Follow-ups, Notes. This is what answers *why*, and *what did we do about it*.
+
+Only 14 of the 200 incidents have a postmortem, which is roughly the ratio you would find in a real organisation. That asymmetry matters: an agent that searched only documents would conclude most incidents never happened.
+
+### One deliberate choice in the schema
+
+The contact fields live **in the same table as everything else.** They are not hidden in a separate store the agent simply has no connection string for.
+
+That is on purpose. Hiding data by not wiring it up is not access control — it is luck, and it stops being true the moment somebody adds a convenient join. Putting the restricted fields in the same row as the unrestricted ones forces the rule to be enforced where the data is read, which is the only place it holds.
+
+### What is planted in the data
+
+The corpus is generated from a fixed seed, and one pattern is planted deliberately: a connection-pool problem recurring across five payments incidents over ten months, escalating from Sev-3 to a Sev-1, with a deferred follow-up that goes unfixed through three of them.
+
+**None of those five mention "connection pool" in a title or summary.** That is the retrieval test. A second service hits the same failure later and its postmortem notes that the payments writeups would have saved them time — which is the argument for the whole tool in one line.
+
+```bash
+python generate_data.py     # deterministic; SEED=20261005
+```
+
+## How one question flows
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as CLI
+    participant L as Agent loop
+    participant M as Model
+    participant T as Tool layer
+    participant D as Data stores
+
+    U->>L: question + --user + --role
+    Note over L,T: identity is bound here, once,<br/>before the model sees anything
+    L->>T: list tools
+    T-->>L: 5 schemas — none takes a user or role
+    loop until the model answers with text
+        L->>M: question + schemas + results so far
+        M-->>L: "call list_incidents(service='payments')"
+        L->>T: execute that call
+        Note over T,D: authorization checked here,<br/>trace written here
+        T->>D: query
+        D-->>T: rows
+        T-->>L: result (redacted if required)
+    end
+    M-->>L: final answer
+    L->>U: answer + trace table
+```
+
+The line worth remembering: **identity enters at step 2 and never appears again.** Everything after that is the model choosing what to ask for, and the tool layer deciding what the caller is allowed to see. The model participates in the first decision and has no vote in the second.
+
+Walking the same path in code, for the MCP version:
+
+| Step | What happens | Where |
+|---|---|---|
+| 1 | CLI args parsed | `agent_mcp.py` |
+| 2 | `INCIDENT_AGENT_USER` / `_ROLE` / `_SESSION` set, server subprocess spawned | `agent_mcp.py` |
+| 3 | Server binds one `UserContext` from the environment, or refuses to start | `mcp_server.py` |
+| 4 | Tool schemas returned over MCP, reshaped for the model | both |
+| 5 | Model asked; returns a tool call | `agent_mcp.py` |
+| 6 | Tool executed against the session's identity | `mcp_server.py` → `tools.py` |
+| 7 | `@traced` records the call in memory and in `traces.db` | `trace.py` |
+| 8 | Result returned to the model, minus the trace | `agent_mcp.py` |
+| 9 | Repeat 5–8 until the model answers, or `MAX_ITERATIONS` | `agent_mcp.py` |
+| 10 | Question and answer written to `agent_sessions` | `trace.py` |
+
+The direct version in `agent.py` skips steps 2, 3, 4 and 8 — it constructs the `UserContext` itself and calls the Python function. Steps 6 and 7 are identical in both, which is why both agents produce the same rows in the same table.
+
+
+
