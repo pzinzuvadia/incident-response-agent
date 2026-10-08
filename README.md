@@ -511,3 +511,149 @@ That is deliberate. If the two ever disagree, believe the trace rows. Orphaned t
 
 **What it cost.** A write on every tool call, and a decision about what to do when the trace store is unavailable. Here the write is best-effort and prints to stderr on failure, because failing a user's question over a failed audit write is the wrong trade in this system. Where the audit record is a compliance requirement it is the right trade, and that line would raise instead.
 
+## Setup
+
+The quick start at the top is the same thing without explanation. This version says what each step does and what you should see, so you can tell which one failed.
+
+### Prerequisites
+
+**Python 3.10 or later.** The MCP SDK requires it, and `agent_mcp.py` uses `tuple[str, Trace]` annotations that are a syntax error on 3.9.
+
+```bash
+python3 --version
+```
+
+**An Anthropic API key.** Get one at [console.anthropic.com](https://console.anthropic.com). Running the agent costs a fraction of a cent per question. The two inspection scripts cost nothing — they do not call a model.
+
+**About 200MB of disk.** Most of that is the embedding model Chroma downloads on first use.
+
+### 1. Clone and create a virtual environment
+
+```bash
+git clone https://github.com/pzinzuvadia/incident-agent.git
+cd incident-agent
+
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+```
+
+Your prompt should now be prefixed with `(.venv)`.
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Four packages: `anthropic`, `chromadb`, `python-dotenv`, `mcp`. Chroma pulls in a fair amount transitively, so this takes a minute or two.
+
+### 3. Add your API key
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and set:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+`.env` is gitignored. The optional `MODEL` variable overrides the default model if you want to compare behaviour across models — which is worth doing, because tool-choice behaviour differs more than you would expect.
+
+### 4. Generate the incident data
+
+```bash
+python generate_data.py
+```
+
+```
+Wrote 200 incidents to .../data/incidents.db
+Planted payments cluster: INC-0020, INC-0076, INC-0100, INC-0144, INC-0187
+```
+
+Seeded, so you get exactly the same 200 incidents I did. The second line names the recurring failure the retrieval examples depend on.
+
+The 14 postmortems are already in `data/postmortems/` — they are committed, not generated.
+
+### 5. Build the vector store
+
+```bash
+python src/ingest.py
+```
+
+```
+Indexed 69 chunks from 14 postmortems
+Vector store: .../data/chroma
+Chunks per section type: Notes=14, Resolution=14, Root cause=14, Summary=14, Timeline=13
+```
+
+**First run downloads an ~80MB embedding model** (all-MiniLM-L6-v2) and will sit silently for a minute or two while it does. It is cached afterwards.
+
+Note the asymmetry in that last line: one postmortem has no Timeline section, and Follow-ups sections are skipped entirely at ingestion. Both are deliberate.
+
+### 6. Check the layers before asking anything
+
+Neither of these needs an API key. Both print rather than assert — they are for looking, not for passing.
+
+```bash
+python src/check_retrieval.py
+```
+
+Fires six fixed queries at the vector store and prints the top hits with their distances. **Lower distance is closer.** This answers "is retrieval finding the right chunks" without a model in the way.
+
+```bash
+python src/check_mcp.py
+```
+
+Starts the MCP server twice, once as an engineer and once as a contractor, lists the advertised tools, and calls three of them as each user. This answers "is the tool layer enforcing the right rules" without a model in the way.
+
+If the agent later gives a bad answer, these two tell you which layer to blame.
+
+### 7. Ask it something
+
+```bash
+python src/agent.py "How many Sev-1 incidents last quarter, and what was the median resolution time?" --trace
+```
+
+Flags:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--user` | `p.zinzuvadia` | Caller's user id, recorded in the trace |
+| `--role` | `engineer` | `engineer`, `incident_commander`, or `contractor` |
+| `--trace` | off | Print the tool-call trace after the answer |
+| `--verbose` | off | Print each tool call as it happens |
+
+The MCP version takes the same flags:
+
+```bash
+python src/agent_mcp.py "We're seeing payment timeouts again. Has this happened before, and who should I call?" --user ext.contractor --role contractor --trace
+```
+
+### 8. Look at what it did
+
+```bash
+sqlite3 data/traces.db "SELECT session_id, transport, role, tool_calls, question FROM agent_sessions ORDER BY ts DESC LIMIT 5"
+```
+
+Every run you have made is in there, including the refusals.
+
+### If something goes wrong
+
+| Symptom | Cause |
+|---|---|
+| `SyntaxError` on `tuple[str, Trace]` | Python < 3.10 |
+| `chromadb` import fails | Virtual environment not activated |
+| `authentication_error` from the API | `.env` missing, misnamed, or key not saved |
+| `credit balance is too low` | Billing not set up on the API account |
+| `get_collection: postmortems does not exist` | `src/ingest.py` not run yet |
+| `no such table: incidents` | `generate_data.py` not run yet |
+| `ingest.py` hangs on first run | Downloading the embedding model — wait |
+| MCP server exits with code 2 | Identity env vars missing; you launched `mcp_server.py` directly instead of through `agent_mcp.py` |
+
+To start over, delete the generated artifacts and re-run steps 4 and 5. Nothing in `data/` is precious except `postmortems/`:
+
+```bash
+rm -rf data/incidents.db data/chroma data/traces.db
+```
