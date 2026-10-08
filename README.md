@@ -290,5 +290,224 @@ Walking the same path in code, for the MCP version:
 
 The direct version in `agent.py` skips steps 2, 3, 4 and 8 — it constructs the `UserContext` itself and calls the Python function. Steps 6 and 7 are identical in both, which is why both agents produce the same rows in the same table.
 
+## The four decisions
 
+Each of these is stated as a rule first, then as what the rule looked like in this repo, then as what it cost.
+
+---
+
+### 1. Retrieval quality is decided at ingestion, not at query time
+
+**The rule.** When retrieval underperforms, the reflex is to tune the query, raise `top_k`, or swap the embedding model. Those are the knobs nearest to hand, and they are rarely where the problem is. A chunk that lost its context when it was split cannot be found by any query, because the words that would have matched are no longer in it.
+
+**What it looked like here.** Three decisions in `src/ingest.py` do most of the work.
+
+*Chunk on semantic boundaries, not character counts.* Postmortems have sections. A fixed 500-character window splits a root cause across two chunks and staples half of it onto an unrelated timeline entry. Splitting on markdown headings means every chunk is a complete thought.
+
+*Prepend context to every chunk, inside the text that gets embedded.* This is the one that matters most and the one most easily done wrong. Metadata stored alongside a chunk does not help the embedding — the vector is computed from the text. So the context goes in the text:
+
+```python
+# src/ingest.py
+contextual_text = (
+    f"{heading} for {incident_id} ({service}, {severity}, {date}): "
+    f"{title}\n\n{body}"
+)
+```
+
+What actually gets embedded, before and after:
+
+```
+WITHOUT the prefix — unfindable by anything but luck:
+
+    The pool was again running close to its limit at peak, which we knew
+    about and had not addressed. [...]
+
+
+WITH the prefix — carries its own identity into the vector:
+
+    Root cause for INC-0076 (payments, Sev-2, 2026-01-29): Payments p99
+    latency degradation
+
+    The pool was again running close to its limit at peak, which we knew
+    about and had not addressed. [...]
+```
+
+*Drop what will never be retrieved.* Follow-up sections are mostly ticket IDs and owner names. They embed badly, they match noisily, and no one asks questions they answer. `SKIP_SECTIONS` removes them.
+
+14 documents become **69 chunks**. You can inspect retrieval without spending a single model token:
+
+```bash
+python src/check_retrieval.py
+```
+
+**What it cost, and what still does not work.** Section-based chunking means chunk sizes vary a lot — a Timeline section can be ten times the length of a Summary, and long chunks dilute their own embeddings.
+
+Two weaknesses I left in place. Resolution sections retrieve poorly, because they are terse and procedural, so queries phrased as "how was it fixed" underperform. And payments dominates the corpus, so payments chunks surface slightly too eagerly for generic questions.
+
+Both are honest properties of a small corpus, and the structured tool compensates for both — which is the actual lesson. Retrieval does not have to be perfect when the agent has another route to the same fact.
+
+---
+
+### 2. Tool descriptions are documentation with a non-human reader
+
+**The rule.** A tool description is not a comment. It is the only interface the model has at the moment it decides what to call, and it is read literally — including numbers mentioned in passing. A vague description does not produce a confused user. It produces a wrong tool call, and therefore a wrong answer, silently.
+
+**What it looked like here.** Five tools, chosen so that no two of them answer the same question well:
+
+| Tool | Reaches | Answers |
+|---|---|---|
+| `search_postmortems` | Chroma | "Has this happened before? Why?" |
+| `list_incidents` | SQLite | "Which payments incidents this year?" |
+| `get_incident` | SQLite | "What happened in INC-0100?" |
+| `incident_stats` | SQLite | "How many Sev-1s, and the median?" |
+| `get_oncall_contact` | SQLite (restricted) | "Who do I call?" |
+
+Overlapping tools are the most common cause of bad planning. When two tools plausibly fit the same question, the model picks inconsistently between runs, and you have a non-deterministic bug that is painful to reproduce.
+
+So the descriptions say what each tool is *not* for:
+
+```python
+{
+    "name": "search_postmortems",
+    "description": (
+        "Search written postmortem documents by meaning, for questions "
+        "about WHY something happened... Do not use this to count "
+        "incidents or to compute statistics; it searches prose and "
+        "cannot aggregate."
+    ),
+    ...
+}
+```
+
+That last clause removed an entire class of wrong plans.
+
+**The bug that proved the point.** I raised the `limit` default in `list_incidents` from 20 to 50 and nothing changed. The model was passing `limit=20` explicitly — because the number appeared in the tool's description text. The description was the live configuration; the Python default was decoration.
+
+**What it cost.** Writing descriptions this carefully is slow, and they are easy to let drift out of sync with the code. There is no type checker for prose. The failure mode is quiet: nothing errors, the agent just starts choosing differently.
+
+---
+
+### 3. Authorization belongs in the tool, not the prompt
+
+This is the longest of the four, and the one most agent examples get wrong in the same way.
+
+**The pattern that does not hold.** Put the rule in the system prompt — *"only share contact details with engineers."* It works in testing, and it is not a security control. It is an instruction to a probabilistic text generator, and it degrades under paraphrase, under long context, and under anything that looks like a legitimate reason.
+
+You cannot ask a model nicely to keep a secret.
+
+**The pattern that is necessary and not sufficient.** Wire the agent to a fixed allow-list of read-only tools, and nothing else. This is good practice and you should do it. But notice which question it answers: *what can this agent ever do?* It does not answer *what may this particular person see right now?* If every user of the agent reaches the same tools with the same scope, the allow-list has not given you access control. It has given you a smaller blast radius, which is a different and lesser thing.
+
+**What this repo does instead.** Every tool takes a `UserContext` as its first argument, supplied by the caller, never by the model, and never visible to the model:
+
+```python
+@dataclass
+class UserContext:
+    """Who is asking. Supplied by the caller, never by the model."""
+    user_id: str
+    role: str
+
+    @property
+    def may_see_contacts(self) -> bool:
+        return self.role in ROLES_WITH_CONTACT_ACCESS
+
+
+def _redact(row: dict, ctx: UserContext) -> dict:
+    """Single point where the contact-field rule is applied."""
+    if ctx.may_see_contacts:
+        return row
+    return {k: v for k, v in row.items() if k not in RESTRICTED_FIELDS}
+```
+
+Two properties are doing the work. The check lives at the **data layer**, so a new tool that reads the incidents table inherits redaction rather than having to remember the rule — gating `get_oncall_contact` while leaving contact columns in the rows returned by `list_incidents` would be theatre. And a refusal **raises** rather than returning empty, because a refusal is an event worth recording, and because an agent told "denied" behaves very differently from one that silently concludes the data does not exist.
+
+**Where MCP makes the problem real.** Locally, passing a `UserContext` is trivial — the loop and the tool are the same program, so of course you can pass it safely. The hard version only appears once the tools run somewhere else, which is where every real system lives.
+
+MCP describes tools, arguments and results. It has no concept of a caller. The server receives *"call list_incidents with service=payments"*, not *"...on behalf of this authenticated person."* The protocol is silent on identity, and that silence is easy to fill badly:
+
+- **The wrong answer:** add `user` and `role` to each tool's input schema. Now the model supplies them, and a field the model fills is a field the model can fill with anything.
+- **What `mcp_server.py` does:** identity is bound when the server process starts, from the environment the client supplied, before any tool is listed and long before the model sees anything. One `UserContext` per session. It appears in no schema, so the model cannot read it, set it, or argue with it. If the environment is missing, the server refuses to start.
+
+That is the same shape as a gateway that validates a token and hands the backend an already-authenticated principal. The backend does not ask the request who it is.
+
+```bash
+python src/check_mcp.py
+```
+
+```
+SESSION: p.zinzuvadia / engineer        SESSION: ext.contractor / contractor
+  tools advertised: 5                     tools advertised: 5
+  identity fields exposed: none           identity fields exposed: none
+
+  list_incidents     → contacts: True     list_incidents     → contacts: False
+  get_oncall_contact → ok                 get_oncall_contact → denied
+```
+
+Identical tool surface. Different data. The difference is not in the schema, the prompt, or anything the model can reach.
+
+**What it cost.** The MCP path is a subprocess to manage, an async client, a round trip for tool discovery, and a failure mode where the server dies and the agent has no tools at all. Locally that buys nothing — these could stay Python functions. It is here because the authorization argument is weak until the tools are genuinely somewhere else.
+
+The role model is also deliberately crude: two roles, one restricted field set, hardcoded. A real system reads this from the same identity provider that governs every other system, and the agent does not get its own parallel permission model.
+
+---
+
+### 4. Monitoring tells you the service is up. It does not tell you what the agent did.
+
+**The rule.** Standard observability answers: did it respond, how fast, did it error. For an agent, every one of those can be green while the answer is wrong. The question you actually need answered is *why did it say that*, and nothing in a latency dashboard can answer it.
+
+**What it looked like here.** Every tool call is wrapped by a decorator that records it:
+
+```python
+@dataclass
+class TraceEvent:
+    tool: str
+    user: str
+    role: str
+    arguments: dict          # ← the field that earns its place
+    duration_ms: float
+    outcome: str             # "ok" | "denied" | "error"
+    result_summary: str
+```
+
+`arguments` is in there deliberately. Knowing `list_incidents` was called tells you almost nothing. Knowing it was called with `since='2024-10-01'` tells you exactly what went wrong — which is a real bug from this repo, covered in [what broke](#).
+
+Add `--trace` to any run to see it. But printing only helps for a run you are watching, so every event is also written to `data/traces.db`:
+
+```mermaid
+erDiagram
+    agent_sessions ||--o{ agent_traces : "session_id"
+    agent_sessions {
+        text session_id PK
+        text ts
+        text user_id
+        text role
+        text transport
+        text question
+        text answer
+        int  tool_calls
+    }
+    agent_traces {
+        int  id PK
+        text session_id FK
+        text tool
+        text arguments
+        text outcome
+        real duration_ms
+    }
+```
+
+Two tables because the grain differs: one row per question, one row per tool call. Join them and you have the whole picture.
+
+```sql
+-- every refusal this system has ever issued, and what was asked
+SELECT s.ts, s.user_id, s.question, t.tool, t.arguments
+FROM   agent_sessions s JOIN agent_traces t USING (session_id)
+WHERE  t.outcome = 'denied'
+ORDER  BY s.ts DESC;
+```
+
+**One asymmetry worth naming.** The trace rows are written by the tool layer, at the point where data is actually reached. The session row is written by the agent loop, afterwards, by the component being observed. That is a weaker position — if the loop crashes mid-question, the tool calls are already on disk and the session row never appears.
+
+That is deliberate. If the two ever disagree, believe the trace rows. Orphaned trace rows with no session row are not a logging bug; they are the logging telling you a run died partway through.
+
+**What it cost.** A write on every tool call, and a decision about what to do when the trace store is unavailable. Here the write is best-effort and prints to stderr on failure, because failing a user's question over a failed audit write is the wrong trade in this system. Where the audit record is a compliance requirement it is the right trade, and that line would raise instead.
 
