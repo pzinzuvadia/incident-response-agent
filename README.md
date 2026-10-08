@@ -657,3 +657,175 @@ To start over, delete the generated artifacts and re-run steps 4 and 5. Nothing 
 ```bash
 rm -rf data/incidents.db data/chroma data/traces.db
 ```
+
+## Four questions worth running
+
+The cross-source question is at the top of this README. These are the other three, each chosen because it shows something different about how the system behaves.
+
+### One tool, when one tool is right
+
+```bash
+python src/agent.py "How many Sev-1 incidents last quarter, and what was the median resolution time?" --trace
+```
+
+```
+There were 5 Sev-1 incidents last quarter (July 1 – September 30, 2026),
+with a median resolution time of 90 minutes.
+
+For context, the mean was 104 minutes, and the longest took 207 minutes.
+
+==============================================================================
+TRACE
+==============================================================================
+#   TOOL                 USER            OUTCOME        MS  ARGUMENTS
+---------------------------------------------------------------------------
+1   incident_stats       p.zinzuvadia    ok            0.8  severity='Sev-1', since='2026-07-01', until='2026-09-30'
+    └─ n=5, median=90min
+---------------------------------------------------------------------------
+1 tool call(s), 0.8 ms total in tools
+```
+
+Counting and medians are query operations. The agent did not search a single document, and it should not have — dressing an aggregate up as semantic search makes it slower and less correct.
+
+Note the arguments: the model resolved "last quarter" to a real date range. It did not always. That is the first entry in [what broke](#).
+
+This is also the case that makes the trade-off concrete. If this is the question you ask every Monday, do not build an agent. Build a dashboard. It is faster, cheaper, deterministic, and it cannot hallucinate.
+
+### The same question, from two different people
+
+This is the one that matters.
+
+```bash
+python src/agent_mcp.py "We're seeing payment timeouts again. Has this happened before, and who should I call?" --user p.zinzuvadia --role engineer --trace
+
+python src/agent_mcp.py "We're seeing payment timeouts again. Has this happened before, and who should I call?" --user ext.contractor --role contractor --trace
+```
+
+| | engineer | contractor |
+|---|---|---|
+| `search_postmortems` | ok — 10 chunks, 4 postmortems | ok — 10 chunks, 4 postmortems |
+| `list_incidents` | ok — 48 incidents | ok — 48 incidents |
+| `get_oncall_contact` | ok — Dana Whitfield | **denied** |
+| Incident history in the answer | full five-incident pattern | full five-incident pattern |
+| Contact in the answer | name and phone number | *"I'm not authorized to provide on-call contact information. You'll need to ask someone with appropriate access for the Payments Platform team's on-call contact."* |
+
+The contractor is not locked out of the system. They lose one field. They keep the entire incident history, the root-cause analysis, and the name of the owning team — which is what makes this access control rather than a wall.
+
+And the agent says so plainly instead of inventing a plausible name, because the tool raised rather than returning empty.
+
+Two honest notes about reading this comparison. The prose differs between the two runs beyond the contact line — different wording, different ordering, a slightly different selection of incidents cited. That is planning non-determinism, not a permissions effect. What differs *because of permissions* is exactly one tool outcome and one field. Read the trace, not the paragraphs.
+
+### Refusing to answer
+
+```bash
+python src/agent.py "What did these outages cost us in lost revenue?" --trace
+```
+
+```
+I don't have access to revenue or financial data through the incident tools available to me. The tools I can use provide:
+
+- Incident records (dates, durations, affected services, severity)
+- Postmortem write-ups (root causes, remediation steps, lessons learned)
+- On-call contact information
+- Statistics about incident frequency and resolution times
+
+To get revenue impact estimates, you would need to contact:
+- Your finance or business operations team
+- The service owners who may track revenue metrics for their services
+- Leadership who may have access to revenue dashboards
+
+If you'd like, I can help you identify which incidents occurred during a specific time period, how long services were down, or which services were affected - information that might be useful for a revenue impact analysis.
+
+==============================================================================
+TRACE
+==============================================================================
+(no tool calls)
+```
+
+There is no revenue data anywhere in this system. The agent could have called `incident_stats`, collected durations, and produced an estimate that looked authoritative. It called nothing.
+
+That behaviour comes from one line in the system prompt — *never fill a gap with what you know about software in general* — combined with tool descriptions narrow enough that none of them plausibly fits. During an incident, a confident wrong number is worse than no number, because someone will put it in an email.
+
+### Phrasing changes the plan more than permissions do
+
+A finding from building this, included because it is the kind of thing that looks like a bug and is not.
+
+```bash
+python src/agent_mcp.py "Payment timeouts again, who do I call?" --user ext.contractor --role contractor --trace
+# → 1 tool call: get_oncall_contact, denied
+
+python src/agent_mcp.py "Payment timeouts again, who do I call?" --user p.zinzuvadia --role engineer --trace
+# → 1 tool call: get_oncall_contact, ok
+```
+
+The short phrasing gets one tool call. The longer phrasing at the top of this README gets three. I initially read this as a bug — a refusal causing the agent to abandon the rest of the question — and the controlled run disproved it in one command: the engineer, who is refused nothing, behaves identically. The variable was the wording, not the role. *"Who do I call"* is one explicit question; *"has this happened before, and who should I call"* is two.
+
+Worth noticing what made that diagnosis cheap. Comparing two English paragraphs would have told me nothing. Comparing two traces took one run.
+
+## What broke
+
+Three bugs the trace found and nothing else would have.
+
+**The model invented a date range.** Asked about "last quarter", it resolved it to `2024-10-01` → `2024-12-31` and returned zero results. A model has no reliable sense of today's date, and nothing in the prompt had told it. Standard logs showed a successful call returning an empty set — technically correct, completely unhelpful. The trace showed the arguments, which is the whole difference.
+
+```python
+# the fix, in agent.py
+SYSTEM_PROMPT = f"Today's date is {date.today().isoformat()}. ..."
+```
+
+**A default I changed had no effect.** I raised the `limit` default in `list_incidents` from 20 to 50, and the agent kept returning 20 rows — occasionally missing INC-0100, the Sev-1 that makes the payments pattern obvious. The model was passing `limit=20` explicitly, having read the number out of the tool's description text. The description was the live configuration. The Python default was decoration.
+
+**Planning is non-deterministic, and it mimics other bugs.** The same question produces different tool orders and sometimes different tool counts across runs. Usually every ordering is correct, which makes it easy to miss — and means any test asserting an exact call sequence will flake. It also produces false bug reports: see the phrasing investigation in [four questions worth running](#), where two runs that differed only in wording looked like an authorization failure for about ten minutes.
+
+## What still does not work
+
+Left in place deliberately, because the honest version is more useful than a tidied one.
+
+**Resolution sections retrieve poorly.** They are terse and procedural, so questions phrased as "how was this fixed" underperform compared to "why did this happen". More context in the chunk prefix would help; so would writing better postmortems.
+
+**Payments dominates the corpus.** Five of fourteen postmortems are payments incidents, because that is where the planted pattern lives. Payments chunks surface slightly too eagerly for generic questions. Real corpora are skewed too, just not usually on purpose.
+
+**Retrieval reaches four of the five planted incidents, not five.** The fifth arrives through `list_incidents`. This is the system working as designed rather than a defect — but it is worth saying out loud, because "retrieval found everything" would be a nicer claim and an untrue one.
+
+**The role model is crude.** Two roles, one restricted field set, hardcoded in `tools.py`. A real system reads this from the same identity provider that governs everything else, and the agent does not get its own parallel permission model. Mine does, which is fine for a demonstration and wrong for a deployment.
+
+**Nothing verifies answer quality.** The two inspection scripts check that retrieval returns sensible chunks and that the tool layer enforces its rules. Neither checks whether the final prose is correct. An agent can call exactly the right tool and still misread the number it got back. Closing that gap needs a model-graded eval, which is a different piece of work.
+
+## When not to build this
+
+An agent is the wrong answer more often than the current discourse suggests.
+
+**If you know the questions in advance, build a dashboard.** "Sev-1 count by service this quarter" is a SQL query and a chart. Faster, cheaper, deterministic, correct every time, and it cannot hallucinate. Agents earn their cost when the question space is open — when the useful question is the one nobody anticipated at design time.
+
+**If all your knowledge is already structured, you want a query interface, not retrieval.** Text-to-SQL over a clean schema beats this architecture on accuracy and latency. The pattern here pays off specifically when answers require crossing structured records and written prose, which no single query language spans.
+
+**If you cannot enforce authorization at the data boundary, stop.** If the only thing between a user and data they should not see is a sentence in a prompt, you do not have a prototype. You have a liability with a good demo.
+
+**What it costs when it is the right answer.** A few hundred milliseconds to several seconds per question. A model call per tool round trip. An execution path that is non-deterministic and genuinely harder to test than a query. Those are real prices, and they are worth paying only for the questions a dashboard cannot anticipate.
+
+## What I would build next
+
+In the order I would do it.
+
+**Deployment.** This runs on a laptop. Running it as a service means an HTTP transport instead of stdio, real identity from a token rather than an environment variable, the trace store somewhere durable and shared, and a concurrency model — the MCP server here holds one identity for its whole lifetime, which is correct for a CLI and wrong for a service. That last one is the interesting problem: per-request identity binding instead of per-process.
+
+**A model-graded eval.** Fixed questions, expected answers, a second model judging whether the response matches. It brings its own problems — now you are trusting a grader — but it closes the gap the inspection scripts leave open.
+
+**Live authorization rather than bound-at-start.** Right now identity is fixed when the server process starts. Membership changes do not take effect until the process restarts. The production version of this problem is token lifetime: if a role is revoked, how long until the agent stops honouring it? I hit the same gap on an enterprise MCP deployment at SAP, where group changes took up to an hour to propagate. It is the kind of thing that never surfaces in a demo and always surfaces in an audit.
+
+**Incremental ingestion.** `ingest.py` rebuilds the whole collection every run. Fine for 14 documents, absurd for 14,000. Real corpora need change detection, re-embedding only what moved, and a story for deletions.
+
+## The pattern, without the incidents
+
+None of this is really about incident response.
+
+The shape is: knowledge split across structured records and written documents, questions that span both, and different people who should see different subsets of it. Wherever that holds, the same four pieces apply — retrieval with the real decisions made at ingestion, tools for what retrieval cannot do, authorization at the tool boundary and per user rather than per agent, and a durable record of what was actually called.
+
+Claims history plus policy documents plus adjuster permissions. Patient records plus clinical notes plus role-based access. Customer accounts plus support transcripts plus tiered agent visibility.
+
+Change the domain and the data. The engineering does not move.
+
+---
+
+*Built by [Priyansh Zinzuvadia](https://www.linkedin.com/in/pszinzuvadia/). The longer argument is on [Medium](#MEDIUM).*
+
