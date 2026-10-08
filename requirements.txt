@@ -1,0 +1,4 @@
+anthropic
+chromadb
+python-dotenv
+mcp
