@@ -78,6 +78,7 @@ Three things in that output are worth noticing before anything else.
 
 **The same question from a contractor returns the same history and no phone number.** The refusal happens inside the tool, not in the prompt. That one is the longest section of this README.
 
+
 ## The agent is the easy part
 
 The loop in this repo is about few lines. Send the question and the tool schemas to a model, run whatever tool it asks for, send the result back, repeat until it answers with text instead of another tool call. That is the entire agent, and it is the least interesting file here.
